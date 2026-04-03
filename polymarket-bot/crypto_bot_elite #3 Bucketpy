@@ -1,0 +1,1153 @@
+import os, time, requests, threading, json, re
+
+try:
+    import websocket
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+from datetime import datetime, timezone, timedelta
+from collections import deque
+from dotenv import load_dotenv
+
+# SDK OFICIAL DE POLYMARKET
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, BalanceAllowanceParams, AssetType, OrderType, MarketOrderArgs
+    from py_clob_client.constants import POLYGON
+    SDK_AVAILABLE = True
+except ImportError:
+    SDK_AVAILABLE = False
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+# ─── CONFIGURACIÓN DE USUARIO ─────────────────────────────────────────────────
+MODO_SIMULACION  = os.getenv("SIMULATION_MODE", "true").lower() == "true"
+BET_AMOUNT       = float(os.getenv("BET_AMOUNT", "2.0"))
+STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "20.0"))
+THRESHOLD        = 0.85
+MAX_ENTRY_PRICE  = float(os.getenv("MAX_ENTRY_PRICE", "0.95"))   # Techo BTC: no entrar si prob > 95c
+ETH_MAX_ENTRY_PRICE = 0.92                                        # Techo ETH: no entrar si prob > 92c
+MAX_LOSS_STREAK  = int(os.getenv("MAX_LOSS_STREAK", "4"))         # Pausar tras N pérdidas seguidas
+PAUSE_CYCLES     = int(os.getenv("PAUSE_CYCLES", "2"))            # Ciclos a esperar tras la pausa
+
+# Estrategia Maker 2026: Ventana ajustada de 50 a 10 segundos (Shadow Mode calibrado)
+BET_WINDOW_START = 50
+BET_WINDOW_END   = 10
+MOMENTUM_TICKS   = 4   # 4 lecturas × 0.5s = 2 segundos de confirmación
+
+# API KEYS
+PK              = os.getenv("PK")
+FUNDER          = os.getenv("FUNDER", os.getenv("TRADER_ADDRESS"))
+CLOB_API_KEY    = os.getenv("CLOB_API_KEY")
+CLOB_SECRET     = os.getenv("CLOB_SECRET")
+CLOB_PASSPHRASE = os.getenv("CLOB_PASSPHRASE")
+
+# TELEGRAM
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "trades_history.json")
+SHADOW_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shadow_predictions.json")
+SHADOW_REPORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shadow_report.txt")
+
+GAMMA_API    = "https://gamma-api.polymarket.com"
+CLOB_API     = "https://clob.polymarket.com"
+DATA_API     = "https://data-api.polymarket.com"
+POLYGON_RPC  = "https://polygon-bor-rpc.publicnode.com"
+CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json"
+}
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich import box
+    from rich.text import Text
+    from rich.layout import Layout
+    RICH = True
+    console = Console()
+except ImportError:
+    RICH = False
+
+# ─── CLASES DE APOYO ──────────────────────────────────────────────────────────
+
+class BinanceFeed:
+    """Feed de precio en tiempo real vía WebSocket de Binance (aggTrade) con fallback HTTP."""
+    def __init__(self, symbol: str):
+        self.symbol = symbol.lower()
+        self.price = 0.0
+
+    def start(self):
+        # Precio inmediato por HTTP antes de que conecte el WebSocket
+        try:
+            r = requests.get("https://api.binance.com/api/v3/ticker/price",
+                             params={"symbol": self.symbol.upper()}, timeout=3)
+            self.price = float(r.json().get("price", 0))
+        except Exception:
+            pass
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        url = f"wss://stream.binance.com:9443/ws/{self.symbol}@aggTrade"
+        while True:
+            try:
+                if WS_AVAILABLE:
+                    ws = websocket.WebSocketApp(
+                        url,
+                        on_message=self._on_message,
+                        on_error=lambda ws, e: None,
+                        on_close=lambda ws, c, m: None,
+                    )
+                    ws.run_forever(ping_interval=30)
+                else:
+                    # Fallback: polling HTTP cada segundo
+                    while True:
+                        try:
+                            r = requests.get("https://api.binance.com/api/v3/ticker/price",
+                                             params={"symbol": self.symbol.upper()}, timeout=2)
+                            self.price = float(r.json().get("price", 0))
+                        except Exception:
+                            pass
+                        time.sleep(1)
+            except Exception:
+                pass
+            time.sleep(5)
+
+    def _on_message(self, ws, msg):
+        try:
+            data = json.loads(msg)
+            if "p" in data:
+                self.price = float(data["p"])
+        except Exception:
+            pass
+
+
+class MarketEngine:
+    def __init__(self, asset_name, ticker_binance, slug_prefix):
+        self.asset = asset_name
+        self.ticker = ticker_binance
+        self.prefix = slug_prefix
+
+        self.live_price = 0.0
+        self.target_price = 0.0
+        self.market_data = None
+        self.prices = {"UP": 0.0, "DOWN": 0.0}
+        self.price_history = {"UP": deque(maxlen=MOMENTUM_TICKS), "DOWN": deque(maxlen=MOMENTUM_TICKS)}
+        self.token_ids = {}
+        self.seconds_left = 0
+        self.bet_placed = False
+        self.market_id = None
+        self._ask_books = {"UP": {}, "DOWN": {}}  # {price_str: size_float}
+        self._ws = None
+        self._ws_subscribed_ids = set()
+        self._ws_connected = False
+        self._ws_has_data = False
+        threading.Thread(target=self._poll_prices, daemon=True).start()
+
+    def _poll_prices(self):
+        """Polling HTTP continuo de precios UP/DOWN como respaldo al WebSocket CLOB."""
+        while True:
+            if self.token_ids and not self._ws_has_data:
+                for side, tid in list(self.token_ids.items()):
+                    try:
+                        r = requests.get(f"{CLOB_API}/price",
+                                         params={"token_id": tid, "side": "BUY"}, timeout=1)
+                        p = float(r.json().get("price", 0))
+                        if p > 0:
+                            self.prices[side] = p
+                            self.price_history[side].append(p)
+                    except:
+                        pass
+            time.sleep(1)
+
+    def sync_live_price(self):
+        """Loop continuo que actualiza el precio cada segundo."""
+        while True:
+            try:
+                r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": self.ticker}, timeout=2)
+                self.live_price = float(r.json().get("price", 0))
+            except: pass
+            time.sleep(1)
+
+    def get_target_historical(self, start_iso):
+        try:
+            # Soportar tanto ISO string como timestamp numérico
+            if isinstance(start_iso, (int, float)):
+                ts_ms = int(start_iso) * 1000
+            else:
+                ts_ms = int(datetime.fromisoformat(start_iso.replace("Z", "+00:00")).timestamp()) * 1000
+
+            # Intento 1: vela de 1m que empieza exactamente en ese timestamp
+            r = requests.get("https://api.binance.com/api/v3/klines",
+                             params={"symbol": self.ticker, "interval": "1m", "startTime": ts_ms, "limit": 1},
+                             timeout=3)
+            data = r.json()
+            if isinstance(data, list) and data:
+                return float(data[0][1])  # open price de esa vela
+
+            # Intento 2: pedir la vela anterior (60s antes) y usar su close
+            r2 = requests.get("https://api.binance.com/api/v3/klines",
+                              params={"symbol": self.ticker, "interval": "1m",
+                                      "endTime": ts_ms, "limit": 1},
+                              timeout=3)
+            data2 = r2.json()
+            if isinstance(data2, list) and data2:
+                return float(data2[0][4])  # close price de la vela anterior
+
+        except: pass
+
+        # Fallback final: usar el precio live actual como aproximación
+        return self.live_price if self.live_price else 0.0
+
+    def _best_ask(self, side):
+        book = self._ask_books[side]
+        levels = [(float(p), s) for p, s in book.items() if s > 0]
+        return min(levels)[0] if levels else 0.0
+
+    def _start_ws(self):
+        if not WS_AVAILABLE or not self.token_ids:
+            return
+        new_ids = set(self.token_ids.values())
+        if new_ids == self._ws_subscribed_ids and self._ws_connected:
+            return
+        if self._ws:
+            try: self._ws.close()
+            except: pass
+        self._ws_subscribed_ids = new_ids
+
+        def on_message(ws, message):
+            try:
+                events = json.loads(message)
+                if not isinstance(events, list): events = [events]
+                for event in events:
+                    asset_id = event.get("asset_id")
+                    etype = event.get("event_type")
+                    side = next((s for s, tid in self.token_ids.items() if tid == asset_id), None)
+                    if not side: continue
+
+                    if etype == "book":
+                        self._ask_books[side] = {
+                            e["price"]: float(e["size"])
+                            for e in event.get("sells", [])
+                        }
+                    elif etype == "price_change":
+                        for ch in event.get("changes", []):
+                            if ch.get("side") == "SELL":
+                                self._ask_books[side][ch["price"]] = float(ch["size"])
+
+                    p = self._best_ask(side)
+                    if p > 0:
+                        self.prices[side] = p
+                        self.price_history[side].append(p)
+                        self._ws_has_data = True
+            except: pass
+
+        def on_open(ws):
+            self._ws_connected = True
+            ws.send(json.dumps({"assets_ids": list(self.token_ids.values()), "type": "market"}))
+
+        def on_close(ws, *args):
+            self._ws_connected = False
+            self._ws_has_data = False
+            time.sleep(2)
+            self._start_ws()
+
+        def on_error(ws, err):
+            self._ws_connected = False
+
+        self._ws = websocket.WebSocketApp(
+            "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+            on_message=on_message,
+            on_open=on_open,
+            on_close=on_close,
+            on_error=on_error
+        )
+        threading.Thread(target=self._ws.run_forever, daemon=True).start()
+
+    def has_momentum(self, side):
+        """True si la probabilidad lleva 1s por encima del threshold y con tendencia estable o al alza."""
+        hist = [p for p in self.price_history[side] if p > 0]
+        if len(hist) < 2: return False
+        return all(p >= THRESHOLD for p in hist) and hist[-1] >= hist[0]
+
+    def sync_market(self, now_ts):
+        slug = f"{self.prefix}-{now_ts}"
+
+        if not self.market_data or self.seconds_left <= -10:
+            try:
+                r = requests.get(f"{GAMMA_API}/markets", params={"slug": slug}, headers=HEADERS, timeout=3)
+                if r.json():
+                    new_data = r.json()[0]
+                    if self.market_id != new_data.get("id"):
+                        self.market_id = new_data.get("id")
+                        self.bet_placed = False
+                        self.market_data = new_data
+                        self.price_history = {"UP": deque(maxlen=MOMENTUM_TICKS), "DOWN": deque(maxlen=MOMENTUM_TICKS)}
+
+                        c_ids = self.market_data.get("clobTokenIds")
+                        if isinstance(c_ids, str): c_ids = json.loads(c_ids)
+                        self.token_ids = {"UP": c_ids[0], "DOWN": c_ids[1]}
+                        self._ask_books = {"UP": {}, "DOWN": {}}
+                        self._ws_has_data = False
+                        self._start_ws()
+
+                        start = self.market_data.get("eventStartTime") or self.market_data.get("startDate")
+                        self.target_price = self.get_target_historical(start)
+            except: pass
+
+        # Si el target sigue en 0 (falló en el primer intento), reintentarlo
+        if self.market_data and self.target_price == 0.0:
+            start = self.market_data.get("eventStartTime") or self.market_data.get("startDate")
+            if start:
+                self.target_price = self.get_target_historical(start)
+
+        if self.market_data:
+            end_dt = datetime.fromisoformat(self.market_data.get("endDate").replace("Z", "+00:00"))
+            self.seconds_left = int((end_dt - datetime.now(timezone.utc)).total_seconds())
+
+            if not self._ws_has_data:
+                def _fetch_price(side, tid):
+                    try:
+                        r = requests.get(f"{CLOB_API}/price", params={"token_id": tid, "side": "BUY"}, timeout=1)
+                        p = float(r.json().get("price", 0))
+                        self.prices[side] = p
+                        if p > 0:
+                            self.price_history[side].append(p)
+                    except: pass
+                threads = [threading.Thread(target=_fetch_price, args=(s, tid), daemon=True)
+                           for s, tid in self.token_ids.items()]
+                for th in threads: th.start()
+                for th in threads: th.join()
+
+# ─── SHADOW TRACKER ───────────────────────────────────────────────────────────
+
+class ShadowTracker:
+    """
+    Registra TODAS las predicciones del modelo — apostemos o no — con el resultado real.
+    Genera reporte de calibración por bucket de probabilidad y rango de tiempo al cierre.
+    Úsalo corriendo 4-8h para saber exactamente en qué rango de tiempo y prob hay edge real.
+    """
+
+    PROB_EDGES  = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.01]
+    PROB_LABELS = ["60-65%", "65-70%", "70-75%", "75-80%", "80-85%", "85-90%", "90-95%", "95%+"]
+    TIME_RANGES = [(10, 20, "10-20s"), (20, 30, "20-30s"), (30, 40, "30-40s"),
+                   (40, 50, "40-50s"), (50, 61, "50-60s")]
+
+    def __init__(self):
+        self.predictions = []
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(SHADOW_FILE):
+                with open(SHADOW_FILE) as f:
+                    raw = json.load(f)
+                # Migrar registros viejos que no tengan todas las keys
+                defaults = {"result": None, "close_price": None, "bet_placed": False,
+                            "key": "", "prob": 0.0, "seconds_left": 0, "target_price": 0.0,
+                            "ticker": "", "end_iso": None, "market_id": ""}
+                self.predictions = [{**defaults, **p} for p in raw]
+        except Exception:
+            self.predictions = []
+
+    def _save(self):
+        try:
+            with open(SHADOW_FILE, "w") as f:
+                json.dump(self.predictions, f, indent=2, default=str)
+        except Exception:
+            pass
+
+    def record(self, asset, side, prob, seconds_left, market_id, target_price, end_iso, ticker, bet_placed):
+        """Registra una predicción. Un registro único por (market_id, asset, side)."""
+        key = f"{market_id}_{asset}_{side}"
+        if any(p["key"] == key for p in self.predictions):
+            return
+        self.predictions.append({
+            "key": key,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "asset": asset,
+            "side": side,
+            "prob": round(prob, 4),
+            "seconds_left": seconds_left,
+            "market_id": market_id,
+            "target_price": target_price,
+            "end_iso": end_iso,
+            "ticker": ticker,
+            "bet_placed": bet_placed,
+            "result": None,
+            "close_price": None,
+        })
+        self._save()
+
+    def resolve_pending(self, get_closing_price_fn):
+        """Resuelve predicciones pendientes con precio de cierre real."""
+        now = datetime.now(timezone.utc)
+        changed = False
+        for p in self.predictions:
+            if p.get("result") is not None or not p.get("end_iso"):
+                continue
+            end_dt = datetime.fromisoformat(p["end_iso"].replace("Z", "+00:00"))
+            if now <= (end_dt + timedelta(seconds=15)):
+                continue
+            close = get_closing_price_fn(p["ticker"], p["end_iso"])
+            if not close:
+                continue
+            won = (close >= p["target_price"]) if p["side"] == "UP" else (close < p["target_price"])
+            p["result"] = "WIN" if won else "LOSS"
+            p["close_price"] = close
+            changed = True
+        if changed:
+            self._save()
+
+    def calibration_report(self):
+        """Retorna dict con stats de calibración o None si hay menos de 10 datos."""
+        resolved = [p for p in self.predictions if p["result"] is not None]
+        if len(resolved) < 10:
+            return None
+
+        prob_buckets = {lbl: {"n": 0, "wins": 0} for lbl in self.PROB_LABELS}
+        time_buckets = {lbl: {"n": 0, "wins": 0} for _, _, lbl in self.TIME_RANGES}
+
+        for p in resolved:
+            # bucket de prob
+            for i, (lo, hi) in enumerate(zip(self.PROB_EDGES[:-1], self.PROB_EDGES[1:])):
+                if lo <= p["prob"] < hi:
+                    prob_buckets[self.PROB_LABELS[i]]["n"] += 1
+                    if p["result"] == "WIN":
+                        prob_buckets[self.PROB_LABELS[i]]["wins"] += 1
+                    break
+            # bucket de tiempo
+            for lo, hi, lbl in self.TIME_RANGES:
+                if lo <= p["seconds_left"] < hi:
+                    time_buckets[lbl]["n"] += 1
+                    if p["result"] == "WIN":
+                        time_buckets[lbl]["wins"] += 1
+                    break
+
+        for d in list(prob_buckets.values()) + list(time_buckets.values()):
+            d["wr"] = (d["wins"] / d["n"] * 100) if d["n"] > 0 else None
+
+        bet_n    = sum(1 for p in resolved if p["bet_placed"])
+        bet_wins = sum(1 for p in resolved if p["bet_placed"] and p["result"] == "WIN")
+        total_wr = resolved and sum(1 for p in resolved if p["result"] == "WIN") / len(resolved) * 100
+
+        return {
+            "total": len(resolved),
+            "total_wr": total_wr,
+            "prob_buckets": prob_buckets,
+            "time_buckets": time_buckets,
+            "bet_n": bet_n,
+            "bet_wins": bet_wins,
+            "bet_wr": (bet_wins / bet_n * 100) if bet_n else None,
+        }
+
+    def save_report(self):
+        """Escribe shadow_report.txt con el reporte de calibración."""
+        rpt = self.calibration_report()
+        if not rpt:
+            return "Sin datos suficientes (<10 predicciones resueltas)."
+        lines = [
+            "=" * 45,
+            " SHADOW CALIBRATION REPORT",
+            f" {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 45,
+            f" Total predicciones resueltas : {rpt['total']}",
+            f" Win Rate global (shadow)      : {rpt['total_wr']:.1f}%",
+            f" Apuestas reales               : {rpt['bet_n']} "
+            + (f"({rpt['bet_wr']:.1f}% WR)" if rpt['bet_wr'] is not None else "(sin datos)"),
+            "",
+            "── Por bucket de probabilidad ──",
+        ]
+        for lbl, b in rpt["prob_buckets"].items():
+            if b["n"] > 0:
+                bar = "█" * int(b["wr"] / 5) if b["wr"] else ""
+                lines.append(f"  {lbl:8s} {b['wins']:3d}/{b['n']:3d}  {b['wr']:5.1f}%  {bar}")
+        lines += ["", "── Por rango de tiempo al cierre ──"]
+        for lbl, b in rpt["time_buckets"].items():
+            if b["n"] > 0:
+                bar = "█" * int(b["wr"] / 5) if b["wr"] else ""
+                lines.append(f"  {lbl:7s} {b['wins']:3d}/{b['n']:3d}  {b['wr']:5.1f}%  {bar}")
+        text = "\n".join(lines) + "\n"
+        try:
+            with open(SHADOW_REPORT_FILE, "w") as f:
+                f.write(text)
+        except Exception:
+            pass
+        return text
+
+    def pending_count(self):
+        return sum(1 for p in self.predictions if p["result"] is None)
+
+    def resolved_count(self):
+        return sum(1 for p in self.predictions if p["result"] is not None)
+
+
+# ─── BOT DUAL ─────────────────────────────────────────────────────────────────
+
+class CryptoBotElite:
+    def __init__(self):
+        self.btc = MarketEngine("BTC", "BTCUSDT", "btc-updown-5m")
+        self.eth = MarketEngine("ETH", "ETHUSDT", "eth-updown-5m")
+
+        self.btc_feed = BinanceFeed("btcusdt")
+        self.eth_feed = BinanceFeed("ethusdt")
+        self.btc_feed.start()
+        self.eth_feed.start()
+
+        self.trades = []
+        self.cash = STARTING_BALANCE
+        self.initial_balance = STARTING_BALANCE  # se actualiza con el saldo real al arrancar
+        self.wins = 0
+        self.losses = 0
+        self.client = None
+        self.real_ready = False
+        self.cycle_count = 0
+        self.bets_made = 0
+        self.total_invested = 0.0
+        self.best_pnl = 0.0
+        self.worst_pnl = 0.0
+        self.streak = 0
+        self.btc_wins = 0
+        self.btc_losses = 0
+        self.eth_wins = 0
+        self.eth_losses = 0
+        self.start_time = datetime.now()
+        self.pause_until_cycle = 0   # ciclo en que se reactiva tras racha negativa
+        self.paused_reason = ""
+        self.cycles_without_bet = 0  # ciclos consecutivos sin apostar
+        self.bet_placed_this_cycle = False
+        self._prev_btc_seconds = 9999  # para detectar transición de ciclo
+
+        self.shadow = ShadowTracker()  # Shadow Mode: calibración de predicciones
+
+        if not MODO_SIMULACION: self.setup_real()
+
+    def _refresh_balance(self):
+        saldo = self.sync_real_balance()
+        if saldo > 0:
+            self.cash = saldo
+
+    def sync_real_balance(self):
+        try:
+            balance_info = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            with open("order_error.log", "a") as f:
+                f.write(f"\n[Balance Raw] {datetime.now()}: {balance_info}\n")
+            raw = balance_info.get("balance", 0) if isinstance(balance_info, dict) else 0
+            usdc_balance = int(raw) / 1e6
+            return usdc_balance
+        except Exception as e:
+            import traceback
+            with open("order_error.log", "a") as f:
+                f.write(f"\n[Balance Error] {datetime.now()}: {e}\n{traceback.format_exc()}\n")
+            return 0.0
+
+    def auto_redeem(self):
+        """Detecta posiciones ganadas y las reclama automáticamente en el contrato CTF de Polygon."""
+        if not PK or MODO_SIMULACION:
+            return
+        try:
+            from eth_account import Account
+            from eth_utils import to_checksum_address
+            import eth_abi
+
+            r = requests.get(f"{DATA_API}/positions",
+                             params={"user": FUNDER, "sizeThreshold": 0.01}, timeout=5)
+            if r.status_code != 200:
+                return
+            positions = r.json()
+            redeemables = [p for p in positions if p.get("redeemable")]
+            if not redeemables:
+                return
+
+            account = Account.from_key(PK)
+
+            # ABI encode redeemPositions(address,bytes32,bytes32,uint256[])
+            # keccak256("redeemPositions(address,bytes32,bytes32,uint256[])") = 01b7037c
+            SELECTOR = bytes.fromhex("01b7037c")
+            PARENT_COLL = b'\x00' * 32
+
+            # Obtener nonce actual
+            nonce_resp = requests.post(POLYGON_RPC, json={
+                "jsonrpc": "2.0", "method": "eth_getTransactionCount",
+                "params": [account.address, "latest"], "id": 1
+            }, timeout=5).json()
+            if "error" in nonce_resp:
+                raise Exception(f"RPC nonce error: {nonce_resp['error']}")
+            nonce = int(nonce_resp["result"], 16)
+
+            # Gas price
+            gp_resp = requests.post(POLYGON_RPC, json={
+                "jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 2
+            }, timeout=5).json()
+            if "error" in gp_resp:
+                raise Exception(f"RPC gasPrice error: {gp_resp['error']}")
+            gas_price = int(int(gp_resp["result"], 16) * 1.2)  # +20% para asegurar inclusión
+
+            redeemed = []
+            for pos in redeemables:
+                try:
+                    condition_id = bytes.fromhex(pos["conditionId"].replace("0x", ""))
+                    outcome_idx  = pos.get("outcomeIndex", 0)
+                    index_set    = 1 << outcome_idx  # bit shift: outcome 0 → 1, outcome 1 → 2
+
+                    data = SELECTOR + eth_abi.encode(
+                        ["address", "bytes32", "bytes32", "uint256[]"],
+                        [to_checksum_address(USDC_POLYGON), PARENT_COLL, condition_id, [index_set]]
+                    )
+
+                    tx = {
+                        "nonce": nonce,
+                        "gasPrice": gas_price,
+                        "gas": 200000,
+                        "to": to_checksum_address(CTF_CONTRACT),
+                        "value": 0,
+                        "data": data,
+                        "chainId": 137,
+                    }
+                    signed = account.sign_transaction(tx)
+                    raw_hex = "0x" + signed.raw_transaction.hex()
+                    send_resp = requests.post(POLYGON_RPC, json={
+                        "jsonrpc": "2.0", "method": "eth_sendRawTransaction",
+                        "params": [raw_hex], "id": 3
+                    }, timeout=10).json()
+
+                    if "result" in send_resp:
+                        redeemed.append(f"{pos['title'][:30]} ({pos['outcome']})")
+                        nonce += 1
+                    else:
+                        with open("order_error.log", "a") as f:
+                            f.write(f"\n[Redeem Error] {datetime.now()}: {send_resp}\n")
+                except Exception as e:
+                    with open("order_error.log", "a") as f:
+                        f.write(f"\n[Redeem Tx Error] {datetime.now()}: {e}\n")
+
+            if redeemed:
+                self.telegram(
+                    f"💰 <b>AUTO-REDEEM</b>\n"
+                    + "\n".join(f"✅ {t}" for t in redeemed)
+                )
+                threading.Thread(target=self._refresh_balance, daemon=True).start()
+
+        except Exception as e:
+            with open("order_error.log", "a") as f:
+                f.write(f"\n[AutoRedeem Error] {datetime.now()}: {e}\n")
+
+    def setup_real(self):
+        if SDK_AVAILABLE and PK and CLOB_API_KEY:
+            try:
+                creds = ApiCreds(api_key=CLOB_API_KEY, api_secret=CLOB_SECRET, api_passphrase=CLOB_PASSPHRASE)
+                # CONFIGURACIÓN JUANITO: Signature Type 1 y Funder de Perfil (Magic.link)
+                self.client = ClobClient(
+                    CLOB_API, 
+                    key=PK, 
+                    chain_id=POLYGON, 
+                    creds=creds, 
+                    funder="0x171874eEFFD596E901f4B6573464F2C20F3d359E", 
+                    signature_type=1
+                )
+                
+                if self.client.get_ok() == "OK":
+                    self.real_ready = True
+                    saldo_real = self.sync_real_balance()
+                    if saldo_real > 0:
+                        self.cash = saldo_real
+                        self.initial_balance = saldo_real
+                    print(f"[INFO] Bot conectado con Funder: 0x1718... | Saldo Real: ${self.cash:.2f} USDC")
+            except Exception as e:
+                with open("order_error.log", "a") as f:
+                    f.write(f"\n[Auth Error] Error en setup_real: {e}\n")
+                self.real_ready = False
+
+    # ── Telegram ────────────────────────────────────────────────────────────────
+    def telegram(self, msg):
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+        def _send():
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                    timeout=5
+                )
+            except: pass
+        
+        threading.Thread(target=_send, daemon=True).start()
+
+    # ── Historial persistente ────────────────────────────────────────────────────
+    def save_history(self):
+        try:
+            with open(HISTORY_FILE, "w") as f:
+                json.dump(self.trades, f, indent=2, default=str)
+        except: pass
+
+    # ── Apuesta ─────────────────────────────────────────────────────────────────
+    def place_bet(self, engine, side):
+        token_id = engine.token_ids[side]
+        price = engine.prices[side]
+        res_txt = "VIRTUAL"
+
+        if not MODO_SIMULACION and self.real_ready:
+            try:
+                # TAKER: Orden de mercado indicando solo cuántos dólares gastar
+                order = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=BET_AMOUNT,
+                    side="BUY",
+                )
+
+                # Paso 1: Firmar orden de mercado
+                signed_order = self.client.create_market_order(order)
+
+                # Paso 2: Enviar al CLOB como FOK
+                resp = self.client.post_order(signed_order, OrderType.FOK)
+
+                with open("order_error.log", "a") as f:
+                    f.write(f"\n[Order Resp] {datetime.now()}: {resp}\n")
+
+                if resp and resp.get("success"):
+                    res_txt = "TAKER ✅"
+                    saldo_real = self.sync_real_balance()
+                    if saldo_real > 0:
+                        self.cash = saldo_real
+                else:
+                    res_txt = "FAIL ❌"
+                    with open("order_error.log", "a") as f:
+                        f.write(f"\n[Order Fail] {datetime.now()}: {resp}\n")
+                    return False  # orden fallida: no notificar ni registrar
+            except Exception as e:
+                import traceback
+                with open("order_error.log", "a") as f:
+                    f.write(traceback.format_exc())
+                return False  # error: no notificar ni registrar
+        else:
+            self.cash -= BET_AMOUNT
+            limit_price = price # para el historial
+
+        self.bets_made += 1
+        self.total_invested += BET_AMOUNT
+        end_iso = engine.market_data.get("endDate")
+        self.trades.append({
+            "cycle": self.cycle_count,
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "asset": engine.asset,
+            "side": side,
+            "target": engine.target_price,
+            "price": price,
+            "res": f"{res_txt} (Pend)",
+            "pnl": 0.0,
+            "processed": False,
+            "end_iso": end_iso,
+            "ticker": engine.ticker
+        })
+        engine.bet_placed = True
+
+        modo_txt = "REAL" if self.real_ready and not MODO_SIMULACION else "SIM"
+        self.telegram(
+            f"🎯 <b>ENTRADA {engine.asset}</b>\n"
+            f"Lado: <b>{side}</b> @ {price*100:.0f}c\n"
+            f"Target: ${engine.target_price:,.2f} | Cierre en {engine.seconds_left}s\n"
+            f"Balance: ${self.cash:.2f} | [{modo_txt}]"
+        )
+        return True
+
+    def get_closing_price(self, ticker, end_iso):
+        try:
+            dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            ts_close = int(dt.timestamp() * 1000)
+            r = requests.get("https://api.binance.com/api/v3/klines",
+                             params={"symbol": ticker, "interval": "1m", "startTime": ts_close, "limit": 1})
+            if r.status_code == 200:
+                data = r.json()
+                if data: return float(data[0][1])
+        except: pass
+        return None
+
+    def resolver_pendientes(self):
+        now = datetime.now(timezone.utc)
+        for t in self.trades:
+            if t["processed"]: continue
+            if not t.get("end_iso"): continue
+
+            end_dt = datetime.fromisoformat(t["end_iso"].replace("Z", "+00:00"))
+            if now <= (end_dt + timedelta(seconds=10)): continue
+
+            close_price = self.get_closing_price(t["ticker"], t["end_iso"])
+            if not close_price: continue
+
+            target = t["target"]
+            won = (close_price >= target) if t["side"] == "UP" else (close_price < target)
+
+            if self.real_ready and not MODO_SIMULACION:
+                saldo_real = self.sync_real_balance()
+                if saldo_real > 0:
+                    self.cash = saldo_real
+
+            if won:
+                profit = (BET_AMOUNT / t["price"]) - BET_AMOUNT
+                self.wins += 1
+                t["res"] = "WIN 🏆"
+                t["pnl"] = profit
+                self.streak = self.streak + 1 if self.streak >= 0 else 1
+                if profit > self.best_pnl: self.best_pnl = profit
+                if t["asset"] == "BTC": self.btc_wins += 1
+                else: self.eth_wins += 1
+
+                self.telegram(
+                    f"✅ <b>WIN — {t['asset']} {t['side']}</b>\n"
+                    f"Cierre: ${close_price:,.2f} | Target: ${target:,.2f}\n"
+                    f"P&L: +${profit:.2f} | Balance: ${self.cash:.2f}\n"
+                    f"Racha: +{self.streak}W"
+                )
+            else:
+                self.losses += 1
+                t["res"] = "LOSS 💀"
+                t["pnl"] = -BET_AMOUNT
+                self.streak = self.streak - 1 if self.streak <= 0 else -1
+                if -BET_AMOUNT < self.worst_pnl: self.worst_pnl = -BET_AMOUNT
+                if t["asset"] == "BTC": self.btc_losses += 1
+                else: self.eth_losses += 1
+
+                # Activar pausa si se alcanza el límite de racha negativa
+                if self.streak <= -MAX_LOSS_STREAK:
+                    self.pause_until_cycle = self.cycle_count + PAUSE_CYCLES
+                    self.paused_reason = f"{MAX_LOSS_STREAK} pérdidas seguidas"
+                    self.telegram(
+                        f"⏸ <b>BOT EN PAUSA</b>\n"
+                        f"Racha negativa: {abs(self.streak)} pérdidas seguidas\n"
+                        f"Reanuda en el ciclo {self.pause_until_cycle} (en ~{PAUSE_CYCLES * 5} min)"
+                    )
+
+                self.telegram(
+                    f"❌ <b>LOSS — {t['asset']} {t['side']}</b>\n"
+                    f"Cierre: ${close_price:,.2f} | Target: ${target:,.2f}\n"
+                    f"P&L: -${BET_AMOUNT:.2f} | Balance: ${self.cash:.2f}\n"
+                    f"Racha: {self.streak}L"
+                )
+
+            t["processed"] = True
+            self.save_history()
+
+    def render(self):
+        if not RICH: return
+        console.clear()
+
+        mode = "[bold green]DINERO REAL[/]" if self.real_ready else "[bold yellow]SIMULACIÓN[/]"
+        pnl = self.cash - self.initial_balance
+        roi = (pnl / self.initial_balance * 100) if self.initial_balance else 0
+        total_resolved = self.wins + self.losses
+        win_rate = (self.wins / total_resolved * 100) if total_resolved else 0
+        participation = (self.bets_made / (max(1, self.cycle_count) * 2) * 100)
+        pending = sum(1 for t in self.trades if not t["processed"])
+        elapsed = datetime.now() - self.start_time
+        elapsed_str = f"{int(elapsed.total_seconds()//3600):02d}:{int((elapsed.total_seconds()%3600)//60):02d}:{int(elapsed.total_seconds()%60):02d}"
+        avg_pnl = sum(t["pnl"] for t in self.trades if t["processed"]) / total_resolved if total_resolved else 0
+        pnl_color = "green" if pnl >= 0 else "red"
+        roi_color = "green" if roi >= 0 else "red"
+        is_paused = self.cycle_count < self.pause_until_cycle
+        cycles_to_resume = max(0, self.pause_until_cycle - self.cycle_count)
+
+        # ── Panel de estadísticas generales ─────────────────────────────────────
+        stats = Table(box=box.SIMPLE_HEAD, show_header=False, expand=True, padding=(0,1))
+        stats.add_column(ratio=1); stats.add_column(ratio=1); stats.add_column(ratio=1); stats.add_column(ratio=1)
+
+        stats.add_row(
+            f"Modo: {mode}",
+            f"Balance: [bold yellow]${self.cash:.2f}[/]",
+            f"P&L: [{pnl_color}]{'+' if pnl>=0 else ''}${pnl:.2f}[/]",
+            f"ROI: [{roi_color}]{'+' if roi>=0 else ''}{roi:.1f}%[/]"
+        )
+        streak_txt = f"[green]+{self.streak}W[/]" if self.streak > 0 else f"[red]{self.streak}L[/]" if self.streak < 0 else "[dim]—[/]"
+        stats.add_row(
+            f"Wins: [green]{self.wins}[/]  Losses: [red]{self.losses}[/]",
+            f"Tasa de acierto: [cyan]{win_rate:.1f}%[/]",
+            f"Racha actual: {streak_txt}",
+            f"P&L medio: {'[green]+' if avg_pnl>=0 else '[red]'}${avg_pnl:.2f}[/]"
+        )
+        best_txt = f"[green]+${self.best_pnl:.2f}[/]" if self.best_pnl else "[dim]—[/]"
+        worst_txt = f"[red]${self.worst_pnl:.2f}[/]" if self.worst_pnl else "[dim]—[/]"
+        no_bet_color = "red" if self.cycles_without_bet >= 3 else "yellow" if self.cycles_without_bet >= 1 else "green"
+        stats.add_row(
+            f"Ciclos: [bold]{self.cycle_count}[/]  Apuestas: [bold]{self.bets_made}[/]",
+            f"Sin apostar: [{no_bet_color}]{self.cycles_without_bet} ciclo(s)[/]  Pend: [yellow]{pending}[/]",
+            f"Mejor trade: {best_txt}  Peor: {worst_txt}",
+            f"Invertido: [white]${self.total_invested:.2f}[/]  Tiempo: [dim]{elapsed_str}[/]"
+        )
+
+        # Aviso de pausa si está activa
+        tg_status = "[green]✔ Activo[/]" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "[dim]No config.[/]"
+        if is_paused:
+            stats.add_row(
+                f"[bold red]⏸ PAUSADO — {self.paused_reason}[/]",
+                f"[red]Reanuda en {cycles_to_resume} ciclo(s) (~{cycles_to_resume*5} min)[/]",
+                f"Techo BTC: [cyan]{MAX_ENTRY_PRICE*100:.0f}c[/]  ETH: [cyan]{ETH_MAX_ENTRY_PRICE*100:.0f}c[/]  Momentum: [cyan]{MOMENTUM_TICKS//2}s[/]",
+                f"Telegram: {tg_status}"
+            )
+        else:
+            stats.add_row(
+                f"[green]✔ ACTIVO[/]",
+                f"Pausa tras: [red]{MAX_LOSS_STREAK} pérdidas[/] → {PAUSE_CYCLES} ciclos",
+                f"Techo BTC: [cyan]{MAX_ENTRY_PRICE*100:.0f}c[/]  ETH: [cyan]{ETH_MAX_ENTRY_PRICE*100:.0f}c[/]  Momentum: [cyan]{MOMENTUM_TICKS//2}s[/]",
+                f"Telegram: {tg_status}"
+            )
+
+        border = "red" if is_paused else "white"
+        title = "⚡ CRYPTO BOT ELITE — [bold red]PAUSADO[/]" if is_paused else "⚡ CRYPTO BOT ELITE — Dashboard"
+        console.print(Panel(stats, title=title, border_style=border))
+
+        # ── Panel por activo ────────────────────────────────────────────────────
+        asset_panels = []
+        for asset, w, l in [("BTC", self.btc_wins, self.btc_losses), ("ETH", self.eth_wins, self.eth_losses)]:
+            total_a = w + l
+            wr_a = (w / total_a * 100) if total_a else 0
+            clr = "blue" if asset == "BTC" else "magenta"
+            t = Table(box=box.SIMPLE, show_header=False, padding=(0,1), expand=True)
+            t.add_column(); t.add_column()
+            t.add_row("[green]Wins[/]", f"[green]{w}[/]")
+            t.add_row("[red]Losses[/]", f"[red]{l}[/]")
+            t.add_row("Win Rate", f"[cyan]{wr_a:.1f}%[/]")
+            t.add_row("Operaciones", f"{total_a}")
+            asset_panels.append(Panel(t, title=f"[bold {clr}]{asset} Stats[/]", border_style=clr))
+        console.print(Columns(asset_panels))
+
+        # ── Paneles live por activo ─────────────────────────────────────────────
+        live_panels = []
+        for eng in [self.btc, self.eth]:
+            diff = eng.live_price - eng.target_price if eng.target_price else 0
+            status = Text(f"▲ UP (+{diff:.2f})", style="bold green") if diff >= 0 else Text(f"▼ DOWN ({diff:.2f})", style="bold red")
+            style = "blue" if eng.asset == "BTC" else "magenta"
+
+            t_odds = Table(box=box.SIMPLE, show_header=False, padding=0, expand=True)
+            eng_max = ETH_MAX_ENTRY_PRICE if eng.asset == "ETH" else MAX_ENTRY_PRICE
+            for s in ["UP", "DOWN"]:
+                p = eng.prices[s]
+                # Resaltar si supera techo
+                if p >= eng_max:
+                    color = "yellow"  # sobre el techo, no entraría
+                elif p >= THRESHOLD:
+                    color = "green"
+                elif p >= 0.5:
+                    color = "cyan"
+                else:
+                    color = "white"
+                momentum_icon = " ▲" if eng.has_momentum(s) else ""
+                bar = f"[{color}]{'█' * int(p*20)}{'░' * (20-int(p*20))}[/]"
+                t_odds.add_row(f"{s}", bar, f"[{color}]{p*100:.0f}c{momentum_icon}[/]")
+
+            rem_min, rem_sec = max(0, eng.seconds_left//60), max(0, eng.seconds_left%60)
+            in_window = BET_WINDOW_END <= eng.seconds_left <= BET_WINDOW_START
+
+            # Calcular por qué no está entrando (para mostrarlo en el panel)
+            best_side = None
+            best_prob = 0.0
+            for s in ["UP", "DOWN"]:
+                if eng.prices[s] > best_prob:
+                    best_prob = eng.prices[s]
+                    best_side = s
+
+            asset_max = ETH_MAX_ENTRY_PRICE if eng.asset == "ETH" else MAX_ENTRY_PRICE
+            if eng.bet_placed:
+                bet_style, bet_msg = "bold green", "✔ APOSTADO"
+            elif is_paused:
+                bet_style, bet_msg = "bold red", f"⏸ PAUSADO ({cycles_to_resume}c)"
+            elif not in_window:
+                bet_style, bet_msg = "dim", f"Esperando ventana ({BET_WINDOW_END}-{BET_WINDOW_START}s)"
+            elif best_prob >= asset_max:
+                bet_style, bet_msg = "yellow", f"TECHO — {best_side} {best_prob*100:.0f}c > {asset_max*100:.0f}c"
+            elif best_prob >= THRESHOLD and not eng.has_momentum(best_side):
+                bet_style, bet_msg = "cyan", f"Esperando momentum — {best_side} {best_prob*100:.0f}c"
+            elif best_prob < THRESHOLD:
+                bet_style, bet_msg = "dim", f"Sin señal — max {best_prob*100:.0f}c (min {THRESHOLD*100:.0f}c)"
+            else:
+                bet_style, bet_msg = "cyan", "⏳ Evaluando..."
+
+            info_text = Text()
+            info_text.append(f"{eng.asset}", style=f"bold {style}")
+            info_text.append(f" Live: ${eng.live_price:,.2f}\n", style="white")
+            info_text.append(f"Target: ${eng.target_price:,.2f}\n", style="yellow")
+            info_text.append("Estado: ", style="white"); info_text.append_text(status)
+            info_text.append(f"\n{bet_msg}\n", style=bet_style)
+
+            timer_color = "red" if eng.seconds_left <= BET_WINDOW_START else "yellow" if eng.seconds_left <= 60 else "white"
+            live_panels.append(Panel(Columns([info_text, t_odds]), title=f"{eng.asset} | [{timer_color}]{rem_min:02d}:{rem_sec:02d}[/]", border_style=style))
+
+        console.print(Columns(live_panels))
+
+        # ── Shadow Mode ─────────────────────────────────────────────────────
+        shadow_rpt = self.shadow.calibration_report()
+        shadow_t = Table(box=box.SIMPLE_HEAD, show_header=True, expand=True, padding=(0,1))
+        shadow_t.add_column("Bucket Prob", style="cyan", width=10)
+        shadow_t.add_column("N", width=5)
+        shadow_t.add_column("WR%", width=7)
+        shadow_t.add_column("Bucket Tiempo", style="yellow", width=13)
+        shadow_t.add_column("N", width=5)
+        shadow_t.add_column("WR%", width=7)
+
+        prob_items = list(shadow_rpt["prob_buckets"].items()) if shadow_rpt else []
+        time_items = list(shadow_rpt["time_buckets"].items()) if shadow_rpt else []
+        max_rows = max(len(prob_items), len(time_items)) if shadow_rpt else 0
+
+        for i in range(max_rows):
+            # prob bucket
+            if i < len(prob_items):
+                plbl, pb = prob_items[i]
+                pn = str(pb["n"])
+                if pb["n"] > 0 and pb["wr"] is not None:
+                    wrc = "green" if pb["wr"] >= 55 else "red" if pb["wr"] < 50 else "yellow"
+                    pwr = f"[{wrc}]{pb['wr']:.0f}%[/]"
+                else:
+                    plbl, pn, pwr = f"[dim]{plbl}[/]", "[dim]—[/]", "[dim]—[/]"
+            else:
+                plbl, pn, pwr = "", "", ""
+            # time bucket
+            if i < len(time_items):
+                tlbl, tb = time_items[i]
+                tn = str(tb["n"])
+                if tb["n"] > 0 and tb["wr"] is not None:
+                    wrc = "green" if tb["wr"] >= 55 else "red" if tb["wr"] < 50 else "yellow"
+                    twr = f"[{wrc}]{tb['wr']:.0f}%[/]"
+                else:
+                    tlbl, tn, twr = f"[dim]{tlbl}[/]", "[dim]—[/]", "[dim]—[/]"
+            else:
+                tlbl, tn, twr = "", "", ""
+            shadow_t.add_row(plbl, pn, pwr, tlbl, tn, twr)
+
+        shadow_pending = self.shadow.pending_count()
+        shadow_resolved = self.shadow.resolved_count()
+        global_wr = f"{shadow_rpt['total_wr']:.1f}%" if shadow_rpt else "—"
+        bet_wr = f"{shadow_rpt['bet_wr']:.1f}%" if shadow_rpt and shadow_rpt["bet_wr"] else "—"
+        shadow_title = (
+            f"[bold cyan]Shadow Mode[/]  "
+            f"Resueltas: [white]{shadow_resolved}[/]  "
+            f"Pendientes: [yellow]{shadow_pending}[/]  "
+            f"WR Global: [cyan]{global_wr}[/]  "
+            f"WR Apuestas: [cyan]{bet_wr}[/]"
+        )
+        if not shadow_rpt:
+            from rich.text import Text as RText
+            shadow_info = RText(
+                f"Shadow Mode activo — acumulando datos ({shadow_resolved} resueltas, mín. 10 para calibración)",
+                style="dim"
+            )
+            console.print(Panel(shadow_info, title=shadow_title, border_style="cyan"))
+        else:
+            console.print(Panel(shadow_t, title=shadow_title, border_style="cyan"))
+
+        # ── Historial expandido ─────────────────────────────────────────────────
+        hist = Table(title="📝 Historial de Operaciones", box=box.MINIMAL, expand=True)
+        hist.add_column("#", width=4)
+        hist.add_column("Hora", width=9)
+        hist.add_column("Activo", width=6)
+        hist.add_column("Lado", width=6)
+        hist.add_column("Target", width=12)
+        hist.add_column("Entrada", width=8)
+        hist.add_column("Resultado", width=12)
+        hist.add_column("P&L", width=10)
+        hist.add_column("Estado", width=10)
+
+        for t in reversed(self.trades[-12:]):
+            if t["pnl"] > 0:
+                pnl_txt = f"[green]+${t['pnl']:.2f}[/]"
+            elif "LOSS" in t["res"]:
+                pnl_txt = f"[red]${t['pnl']:.2f}[/]"
+            else:
+                pnl_txt = "[dim]—[/]"
+
+            estado = "[dim]pendiente[/]" if not t["processed"] else "[green]✔[/]"
+            target_txt = f"${t['target']:,.2f}" if t["target"] else "—"
+            side_color = "green" if t["side"] == "UP" else "red"
+            res_color = "green" if "WIN" in t["res"] else "red" if "LOSS" in t["res"] else "yellow"
+
+            hist.add_row(
+                f"[dim]{t['cycle']}[/]",
+                t["time"],
+                f"[{'blue' if t['asset']=='BTC' else 'magenta'}]{t['asset']}[/]",
+                f"[{side_color}]{t['side']}[/]",
+                target_txt,
+                f"{t['price']*100:.0f}c",
+                f"[{res_color}]{t['res']}[/]",
+                pnl_txt,
+                estado
+            )
+        console.print(hist)
+
+    def run(self):
+        while True:
+            self.btc.live_price = self.btc_feed.price
+            self.eth.live_price = self.eth_feed.price
+
+            now_ts = (int(time.time()) // 300) * 300
+            t_btc = threading.Thread(target=self.btc.sync_market, args=(now_ts,), daemon=True)
+            t_eth = threading.Thread(target=self.eth.sync_market, args=(now_ts,), daemon=True)
+            t_btc.start(); t_eth.start()
+            t_btc.join(); t_eth.join()
+
+            is_paused = self.cycle_count < self.pause_until_cycle
+
+            # ── Shadow Mode: registrar predicciones (apostemos o no) ──────────
+            for eng in [self.btc, self.eth]:
+                if (BET_WINDOW_END <= eng.seconds_left <= BET_WINDOW_START
+                        and eng.market_data and eng.market_id and eng.target_price):
+                    for side in ["UP", "DOWN"]:
+                        prob = eng.prices[side]
+                        if prob >= THRESHOLD:
+                            self.shadow.record(
+                                asset=eng.asset,
+                                side=side,
+                                prob=prob,
+                                seconds_left=eng.seconds_left,
+                                market_id=eng.market_id,
+                                target_price=eng.target_price,
+                                end_iso=eng.market_data.get("endDate"),
+                                ticker=eng.ticker,
+                                bet_placed=eng.bet_placed,
+                            )
+
+            # Lógica de apuesta con todos los filtros
+            if not is_paused:
+                for eng in [self.btc, self.eth]:
+                    if BET_WINDOW_END <= eng.seconds_left <= BET_WINDOW_START and not eng.bet_placed:
+                        up, down = eng.prices["UP"], eng.prices["DOWN"]
+                        side = None
+                        max_price = ETH_MAX_ENTRY_PRICE if eng.asset == "ETH" else 0.97
+                        if THRESHOLD <= up < max_price and eng.has_momentum("UP"):
+                            side = "UP"
+                        elif THRESHOLD <= down < max_price and eng.has_momentum("DOWN"):
+                            side = "DOWN"
+                        if side:
+                            if self.place_bet(eng, side):
+                                self.bet_placed_this_cycle = True
+
+            # Ciclo count — detectar transición de positivo a ≤ 0
+            if self._prev_btc_seconds > 0 and self.btc.seconds_left <= 0 and self.btc.market_data:
+                self.cycle_count += 1
+                if not self.bet_placed_this_cycle:
+                    self.cycles_without_bet += 1
+                else:
+                    self.cycles_without_bet = 0
+                self.bet_placed_this_cycle = False
+                # Sincronizar saldo y reclamar ganancias al inicio de cada ciclo
+                if self.real_ready and not MODO_SIMULACION:
+                    threading.Thread(target=self._refresh_balance, daemon=True).start()
+                    threading.Thread(target=self.auto_redeem, daemon=True).start()
+            self._prev_btc_seconds = self.btc.seconds_left
+
+            # Resolver pendientes (trades reales + shadow)
+            self.resolver_pendientes()
+            self.shadow.resolve_pending(self.get_closing_price)
+
+            # Guardar reporte de calibración cada ciclo (sobreescribe)
+            self.shadow.save_report()
+
+            self.render()
+            time.sleep(0.5)
+
+if __name__ == "__main__":
+    bot = CryptoBotElite()
+    bot.run()

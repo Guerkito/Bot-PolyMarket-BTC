@@ -1,0 +1,28 @@
+# Entornos virtuales
+venv/
+polymarket-bot/venv/
+.venv/
+
+# Secretos y configuración local
+.env
+polymarket-bot/.env
+.claude/
+*.local.json
+
+# Logs y datos de salida
+*.log
+polymarket-bot/*.log
+shadow_report.txt
+shadow_predictions.json
+trades_history*.json
+analisis_trades.csv
+analisis_completo.xlsx
+
+# Cache de Python
+__pycache__/
+polymarket-bot/__pycache__/
+*.py[cod]
+
+# Otros
+.DS_Store
+bin/
